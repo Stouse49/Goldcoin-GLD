@@ -38,9 +38,12 @@
 #include "validationinterface.h"
 #include "versionbits.h"
 #include "warnings.h"
+#include "net.h"
+#include "checkpoints.h"
 
 #include <atomic>
 #include <sstream>
+#include <memory>
 
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -1160,14 +1163,14 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     }
     else if (nHeight >= consensusParams.julyFork && nHeight <= 26325000)
     {
-        consensusParams.hardForkedJuly = true;
+        const_cast<Consensus::Params&>(consensusParams).hardForkedJuly = true;
         if (nHeight >= consensusParams.febFork) {
-            nSubsidy = (int64)(50.0 / (1.1 + 0.49 * ((nHeight + 4884000 - consensusParams.julyFork) / 262800))) * COIN;
+            nSubsidy = (int64_t)(50.0 / (1.1 + 0.49 * ((nHeight + 4884000 - consensusParams.julyFork) / 262800))) * COIN;
         } else {
-            nSubsidy = (int64)(50.0 / (1.1 + 0.49 * ((nHeight - consensusParams.julyFork) / 262800))) * COIN;
+            nSubsidy = (int64_t)(50.0 / (1.1 + 0.49 * ((nHeight - consensusParams.julyFork) / 262800))) * COIN;
         }
         if (nHeight >= consensusParams.novemberFork) {
-            consensusParams.hardForkedNovember = true;
+            const_cast<Consensus::Params&>(consensusParams).hardForkedNovember = true;
         }
     } else {
         nSubsidy = 0;
@@ -2825,7 +2828,7 @@ bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, const 
 std::shared_ptr<CBlockIndex> GetPreviousBlock(const CBlock& block, int64_t numBlocksBefore) {
     if(numBlocksBefore <= 0) { //Asking for the same block??
         if(mapBlockIndex.count(block.GetHash())) {
-            return mapBlockIndex.at(block.GetHash());
+            return std::shared_ptr<CBlockIndex>(mapBlockIndex.at(block.GetHash()));
         }
         return nullptr;
     }
@@ -2833,14 +2836,14 @@ std::shared_ptr<CBlockIndex> GetPreviousBlock(const CBlock& block, int64_t numBl
     int64_t count = 1;//Start at the previous block
     std::shared_ptr<CBlockIndex> cur = nullptr;
     if(mapBlockIndex.count(block.hashPrevBlock)) {
-        cur = mapBlockIndex.at(block.hashPrevBlock);
+        cur = std::shared_ptr<CBlockIndex>(mapBlockIndex.at(block.hashPrevBlock));
     }
 
     if(!cur) {
         return nullptr;//we dont have its previous block
     }
     while(count < numBlocksBefore ) {
-        cur = cur->pprev;
+        cur = std::shared_ptr<CBlockIndex>(cur->pprev);
         if(!cur) {
             return nullptr;//chain depth does not go that far
         }
@@ -2907,7 +2910,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
                 if ((block.nTime - theBlock->nTime) < (60 * 10)) {
                     //The block is too far into the future but still not far enough to pass the 51% defense
                     //Thus it is useless and will be rejected
-                    return error("CheckBlock() : block timestamp too far in the future 2, Seconds between blocks is: %d", QDateTime::fromTime_t(theBlock->GetBlockTime()).secsTo(QDateTime::fromTime_t(GetBlockTime())));
+                    return error("CheckBlock() : block timestamp too far in the future 2, Seconds between blocks is: %d", block.nTime - theBlock->nTime);
                 } else if ((block.nTime - theBlock->nTime) >= (60 * 10)) {
                     //A valid block has been found but the current network adjusted time will not permit it to be accepted by other peers
                     //Thus we hold the block until GetAdjustedTime() is such that if(GetBlockTime() > GetAdjustedTime() + 45) is false
@@ -2916,10 +2919,10 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
                     //We use a timer to retry this process when the timestamp is right
                     boost::asio::io_service io;
                     boost::asio::deadline_timer timer(io, boost::posix_time::seconds(block.GetBlockTime() - (GetAdjustedTime() + 45)));
-                    timer.async_wait(boost::bind(QueuedBlockHandler, boost::asio::placeholders::error, std::make_shared(block);));
+                    timer.async_wait(boost::bind(QueuedBlockHandler, boost::asio::placeholders::error, std::shared_ptr<const CBlock>(&block)));
 
-                    boost::thread t(&asio::io_service::run, &io);
-                    t.detach();
+                    //boost::thread t(&boost::asio::io_service::run, &io);
+                    //t.detach();
 
                     //To return availability to current thread
                     return state.DoS(0, false, REJECT_INVALID, "rejected-by-def", false, "block timestamp too far for current network time, block queued");
@@ -3077,7 +3080,7 @@ static bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state
         if (std::shared_ptr<CBlockIndex> theBlock = GetPreviousBlock(block, 5)) // 4 + 1 = 5th previous block (total duration of 6 blocks)
         
         /* 51% Defense stuff */
-        if(pindexPrev.nHeight > chainparams.GetConsensus().octoberFork)
+        if(pindexPrev->nHeight > chainparams.GetConsensus().octoberFork)
         if ((block.nTime - theBlock->nTime) < (60 * 10)) {
             return error("\n AcceptBlock() : Possible Multipeer 51 percent detected, Denying chain switch.. \n");
         }
@@ -3173,8 +3176,8 @@ static bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CValidation
 
     //Checkpoint this block's 10th anscestor 51% Defense
     if (checkpointBlockNum <= nHeight && checkpointBlockNum != 0) {
-        if (std::shared_ptr<CBlockIndex> theBlock = GetPreviousBlock(pblock, 10))
-            Checkpoints::AddCheckPoint(chainparams.Checkpoints(), nHeight - 10, theBlock->GetHash());
+        if (std::shared_ptr<CBlockIndex> theBlock = GetPreviousBlock(*pblock, 10))
+            Checkpoints::AddCheckPoint(chainparams.Checkpoints(), nHeight - 10, theBlock->GetBlockHash());
     }
 
     // Write block to history file
@@ -3215,15 +3218,15 @@ bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<cons
         if (ret) {
 
             //Do 51% transmitance check, if it triggers, add a badpoint and ban the peer
-            if(std::share_ptr<CBlockIndex> theBlock = GetPreviousBlock(pblock, 5))
-            if(pblock.nTime - theBlock.nTime < (60*10)) {
+            if(std::shared_ptr<CBlockIndex> theBlock = GetPreviousBlock(*pblock, 5))
+            if(pblock->nTime - theBlock->nTime < (60*10)) {
                 defenseDelayActive = true;
                 time(&defenseStartTime);
-                CNode* pfrom = state.pfrom;
+                CNode* pfrom = (CNode*)state.pfrom;
                 //If the block being accepted isn't local
                 if (pfrom && pfrom->addr.ToString().find("local") == std::string::npos && pfrom->addr.ToString().find("127.0.0.") == std::string::npos) {
                     //We blacklist this block
-                    Checkpoints::AddBadPoint(chainActive.Height(), hash);
+                    Checkpoints::AddBadPoint(chainparams.Badpoints(), chainActive.Height(), pblock->GetHash());
 
                     //Schedule checkpoint 12 blocks from now
                     checkpointBlockNum = chainActive.Height() + 12;
